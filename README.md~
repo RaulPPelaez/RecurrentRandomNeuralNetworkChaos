@@ -1,0 +1,9 @@
+# Timing and sequences from chaos in Recurrent Random Neural Networks
+
+This is a project I did along Ernesto Segredo Otero for a Neurophysics class in the Master in Physics of Condensed Matter and Biological Systems I did at UAM.
+
+The work is based on [1] and attempts to reproduce their results.  
+
+## References  
+
+[1] Rodrigo Laje & Dean V Buonomano 2013. Robust timing and motor patterns by taming chaos in recurrent neural networks [https://www.nature.com/articles/nn.3405](https://www.nature.com/articles/nn.3405)

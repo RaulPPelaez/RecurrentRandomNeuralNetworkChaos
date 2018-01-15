@@ -1,0 +1,16 @@
+To use the tablet as an input device we use:
+
+$  git clone https://github.com/rfc2822/GfxTablet
+
+
+Install GfxTablet apk from F-droid (look for the apk in google) or by compiling it from github.
+
+
+You need the IP of the computer for the apk, use:
+
+$  ifconfig | grep inet | head -1 | awk '{print $2}'
+
+
+To record a word and get a .xy file:
+
+$  bash getWord.bash

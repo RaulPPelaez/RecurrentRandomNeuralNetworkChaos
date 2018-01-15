@@ -1,0 +1,93 @@
+/*Raul P. Pelaez and Ernesto Segredo, 2016
+Filters and interpolates X Y data to make it compatible with the
+RRN.
+Takes a two column input with x,y coordinates from a tablet,
+removes duplicate points and interpolates so it always has 1322 points.
+ */
+
+#include<iostream>
+#include<fstream>
+#include<string>
+#include<vector>
+#include<iomanip>
+#include"spline.h"
+
+using namespace std;
+
+int main(int argc, char *argv[]){
+
+  std::ifstream in(argv[1]);
+  int nsamples = 1322;
+  if(argc>2)
+    nsamples = atoi(argv[2]);
+  int nlines = 0;
+  std::string line;
+  while(std::getline(in, line)) ++nlines;
+  cerr<<nlines<<endl;
+  in.close();
+  if(nlines<=5){cerr<<"The file is empty!!"<<endl; exit(1);}
+  nlines -= 5;
+  in.open(argv[1]);
+  
+  double datax[nlines];
+  double datay[nlines];
+
+  for(int i=0; i<5; i++) in>>datax[0]>>datay[0];
+  for(int i=0; i<nlines; i++) in>>datax[i]>>datay[i];
+  
+  std::vector<double> fdx;
+  std::vector<double> fdy;
+  fdx.reserve(nlines);
+  fdy.reserve(nlines);
+  
+  for(int i=1; i<nlines; i++){
+    if(datax[i]!=datax[i-1] ||
+       datay[i]!=datay[i-1]){
+      fdx.push_back(datax[i-1]);
+      fdy.push_back(datay[i-1]);      
+    }
+  }
+
+
+  
+  int N = fdx.size();
+  cerr<<N<<endl;
+
+  double max = 0.0, min=fdx[0];
+
+  for(int i=0; i<N; i++){
+    if(fdx[i]>max) max = fdx[i];
+    if(fdy[i]>max) max = fdy[i];
+
+    if(fdx[i]<min) min = fdx[i];
+    if(fdy[i]<min) min = fdy[i];
+
+  }
+  min = abs(min);
+  for(int i=0; i<N; i++){
+    fdx[i] = (fdx[i]+min)-(max+min)/2;
+    fdy[i] = (fdy[i]+min)-(max+min)/2;
+
+    fdx[i] /= (max+min);
+    fdy[i] /= (max+min);
+
+  }
+
+
+
+  vector<double> X(N);
+  for(int i=0; i<N;i++) X[i] = i;
+
+  tk::spline sx,sy;
+  sx.set_points(X, fdx);
+  sy.set_points(X, fdy);
+
+  double dt = N/(double)nsamples;
+  double t = 0.0;
+  for(int i=0;i<nsamples;i++){
+    t += dt;
+    cout<<setprecision(5)<<sx(t)<<" "<<-sy(t)<<endl;
+  }
+
+  return 0;
+}

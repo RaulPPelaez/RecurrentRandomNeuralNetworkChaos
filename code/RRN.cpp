@@ -1,0 +1,535 @@
+/*Raul P. Pelaez 2016.
+ Based on Robust timing and motor patterns by taming chaos in recurrent neural networks. Rodrigo Laje et. al doi:10.1038/nn.3405 from 2013
+
+Recurrent Random Network training and integrator
+This code creates a random recurrent network and trains it to reproduce some two dimensional input.
+First gathering an innate neural trajectorie by letting the network evolve from a random initial configuration.
+Then training the recurrent network to replicate this trajectory by making some neural connections plastic, using the RLS/FORCE algorithm.
+Finally training the output connections to replicate some desired input.
+
+The program starts at main, start reading there.
+
+Usage:
+
+RRN target.xy [opt]
+
+[opt]:
+--notrain              --- Only integrate one loop, without training
+--nosave               --- Do not save the network state at the end
+--load   fileName      --- Read network from fileName
+--perturbation         --- Perform a perturbation in the input at some hardcoded time
+--noiseAmp   X         --- Noise amplitud to inject in the network when not training
+--pconnect   X         --- Conection probability, 0.1 by default
+
+
+*/
+#include"math_helper.h"  //Useful mathematical tools
+#include"Timer.h"  //A time counter
+#include<fstream>
+#include<stdio.h> 
+#include<string>   
+#include<vector>
+#include<cmath>
+#include<iostream>
+
+using namespace std;
+
+
+void sigmoid(Vector &Vin, Vector &Vout){
+  fori(0, Vin.n) Vout[i] = tanh(Vin[i]);
+}
+
+//This struct contains the parameters associated with the network, you can add anything here ans use it in the simulation
+struct NetworkParameters{
+  int N;           //Number of recurrent units
+  int Nplastic;    //Number of plastic units
+  float Anoise;    //Noise amplitude
+  float pc;        //Sparsity parameter
+  float scale;     //Scaling for the recurrent matrix
+  float g;         //Synaptic strength scaling factor
+  float delta;
+  float tau;       //Time constant
+};
+
+//This struct contains parameters related with the time integration and configuration of the simulation, you can add anything here and use it in the simulation
+struct SimulationParameters{
+  int nloops;     //Number of integration loops 
+  int learn_skip; //Train every learn_skip steps during the window
+  float dt;       //Integration time step
+
+  int start_pulse;     //Start and duration of the trigger pulse, in steps
+  int reset_duration;
+  float input_pulse_value; //Amplitude of the input trigger pulse
+  
+
+  float start_train; //Training window, in steps
+  float end_train;
+
+  int nsteps;  //Number of time steps in an integration loop
+  
+  bool get_innate; //Gather and save innate trajectory
+  bool saveX;      //Save the fire rates vs time to file, each loop
+  bool saveZ;      //Save the output vs time to file, each loop
+  bool perturbation; //Produces a perturbation at some hardcoded time via a pulse in the input
+};
+
+//Current integration mode. None equals to integrate without training
+enum TRAINING_MODE {READOUT, RECURRENT, NONE};
+
+
+class RRN{
+  Matrix Wrec; //Wrec, NxN
+  Matrix Win; //WIn   Nxninputs
+  Matrix Wout; //Wout  noutputsxN
+  Vector Xv, X, Z; //Neural state, firing rates and output units
+  vector<vector<float>> target; //Target XY data
+  Matrix ZvsT, XvsT;
+  NetworkParameters np;
+  SimulationParameters sp;
+  RNG rng; //Random number generator, using Xorshift128+
+  int N;   //Number of recurrent units
+  void init(){
+    //****Initialize recurrent matrix****//
+    Matrix Wrec_mask(N,N);
+    Wrec_mask.randf(rng);
+    //Random connections with random weigths
+    fori(0,N*N)
+      if(Wrec_mask.data[i] <= np.pc)
+	Wrec_mask.data[i] = 1;
+      else 
+	Wrec_mask.data[i] = 0;
+
+    Wrec.randn(rng, 0.0f, 1.0f);
+    Wrec *= np.scale;
+    Wrec *= Wrec_mask;
+    //No self connections
+    fori(0,N) Wrec[i][i] = 0.0f;
+    
+    //Random input weigths
+    Win.randn(rng, 0.0f, 1.0f);
+    //Random initial output weigths
+    Wout.randn(rng, 0.0f, 1.0f);
+    Wout *= 1.0f/sqrt(N);
+
+  }
+public:
+  RRN(vector<vector<float>> &target,
+      NetworkParameters np,
+      SimulationParameters sp): //Initialization list...
+    sp(sp), np(np), 
+    N(np.N),
+    Xv(np.N), X(np.N), Z(2),
+    ZvsT(sp.nsteps, 2), XvsT(sp.nsteps, np.N),
+    Wrec(np.N,np.N), Win(np.N,2), Wout(2,np.N),
+    target(target)
+  {
+    srand(time(NULL));
+    rng.seed(rand(), rand());
+    init();
+  };
+
+  void update_params(NetworkParameters np,
+		     SimulationParameters sp){
+    this->np = np;
+    this->sp = sp;
+  }
+  
+  void train_network(TRAINING_MODE mode){
+    /**Create the input**/
+    //Input is always null, except during a brief window before training
+    Vector input_pattern[2] = {Vector(sp.nsteps), Vector(sp.nsteps)};
+    Vector Input(2); //helper vector, current input state
+    
+    input_pattern[0].fill_with(0.0f);
+    input_pattern[1].fill_with(0.0f);
+    
+    fori(sp.start_pulse, sp.start_pulse+sp.reset_duration)
+      input_pattern[0][i] = sp.input_pulse_value;
+    //If a perturbation is set
+    if(mode==NONE && sp.perturbation){
+      fori(sp.start_pulse+500, sp.start_pulse+500+10)
+	input_pattern[0][i] = sp.input_pulse_value/10.0f;
+    }
+    //Start without training
+    bool training = false;
+    
+    //Auxiliar vectors
+    Vector Xv_current(N);
+    
+    //Output file streams
+    ofstream out;
+    ofstream out2;
+    ofstream out3;
+    ofstream out4;
+    
+    
+    Timer tim; tim.tic();
+
+    float Xv_amp = np.Anoise*sqrt(sp.dt); //Noise amplitude
+    //Print info
+    cerr<<"Starting ";
+    switch(mode){
+    case READOUT: cerr<<"readout training"; break;
+    case RECURRENT: cerr<<"recurrent training"; break;
+    case NONE: cerr<<""; break;
+    default: cerr<<"unknown "; break;
+    }
+    cerr<<" integration: "<<endl;
+
+
+    /**Integration loop**/
+    for(int loop=0; loop<sp.nloops; loop++){
+      if(sp.get_innate) out3.open("Xtarget.dat");
+      if(sp.saveX)      out2.open("X.dat");
+      
+      cerr<<"\rLoop: "<<1+loop<<"/"<<sp.nloops;
+      //Random initial neuron state
+      Xv.randf(rng, -1.0f, 1.0f);
+      sigmoid(Xv, X); //Compute firing rates
+      /**One integration loop**/
+      for(int step=0; step<sp.nsteps; step++){
+	/**Get current input**/
+	Input[0] = input_pattern[0][step];
+	Input[1] = input_pattern[1][step];
+
+	/******INTEGRATION**********/
+	//X = sigmoid(Xv)
+	// tau* dXv/dt = -Xv + Wrec*X + Win*Input + Noise
+	// z = Wout*X
+	if(Xv_amp!=0) Xv_current.randn(rng, 0.0f, Xv_amp);
+	else          Xv_current.fill_with(0.0f);
+       
+	Xv_current += Wrec*X;
+
+	if(Input[0] != 0 || Input[1] != 0){
+	  Xv_current += Win*Input;
+	}
+	
+	fori(0,N) Xv[i] += (sp.dt/np.tau)*(Xv_current[i]-Xv[i]);
+
+	/****************Rates************/
+	sigmoid(Xv, X);
+	
+	if(sp.saveX){
+	  out2<<step<<" ";
+	  fori(0,N) out2<<X[i]<<" ";
+	  out2<<endl;
+	}
+
+
+	/**************Output**************/
+	if(mode!=RECURRENT)
+	  Z = Wout*X;
+	
+	/************Training window************/
+	if(step==sp.start_train) training = true;
+	else if(step==sp.end_train) training = false;
+
+	/***************TRAINING****************/
+	if(training && step%sp.learn_skip==0 ){
+	  switch(mode){
+	  case READOUT:   train_readout_step(step);   break;
+	  case RECURRENT: train_recurrent_step(step); break;
+	  case NONE:                                  break;
+	  }
+	}//ENDIF TRAIN
+	//Save state in the last loop
+	if(loop==sp.nloops-1 && sp.get_innate){
+	  std::copy(X.data, X.data+N, XvsT[step]);
+	  out3<<step<<" ";
+	  fori(0,N) out3<<X[i]<<" ";
+	  out3<<endl;
+	}
+
+	
+	if(sp.saveZ){
+	  ZvsT[step][0] = Z[0];
+	  ZvsT[step][1] = Z[1];
+	}
+
+      }//ENDFOR STEPS 
+      //Save output
+      if(sp.saveZ){
+	out.open("output.xy");
+	fori(0, sp.nsteps){
+	  out<<i<<" ";
+	  out<<ZvsT[i][0]<<" ";
+	  out<<ZvsT[i][1]<<"\n";
+	}
+	out.close();
+      }
+      if(sp.saveX){
+	out2.close();
+      }
+      if(sp.get_innate)
+	out3.close();
+    }//ENDFOR NLOOPS
+    cerr<<" Elapsed time: "<<tim.toc()<<"s"<<endl;
+  }
+
+
+  void save(){
+    //Save Wrec, Wout, Win and target
+    ofstream out("SaveFile.dat");
+    out<<N<<"\n";
+
+    fori(0,N){
+      forj(0,N) out<<Wrec[i][j]<<" ";
+      out<<"\n";
+    }
+    
+    fori(0,N) out<<Wout[0][i]<<" "<<Wout[1][i]<<"\n";
+    fori(0,N) out<<Win[i][0]<<" "<<Win[i][1]<<"\n";
+    fori(0,target[0].size()) out<<target[0][i]<<" "<<target[1][i]<<"\n";
+  }
+  void load(const char *fileName){
+    //Load Wrec, Wout, Win and target
+    ifstream in(fileName);
+    int Nnew;
+    in>>Nnew;
+    if(Nnew!=N){
+      cerr<<"Please create a network with the same number of neurons as in "<<fileName<<"!!";
+      exit(1);
+    }
+    fori(0,N) forj(0,N) in>>Wrec[i][j];
+    
+    fori(0,N) in>>Wout[0][i]>>Wout[1][i];
+    fori(0,N) in>>Win[i][0]>>Win[i][1];
+    target[0].clear();
+    target[1].clear();
+    float t1, t2;
+    while(in){
+      in>>t1>>t2;
+      target[0].push_back(t1);
+      target[1].push_back(t2);
+    }
+    
+
+  }
+private:
+  //Update Wout according to the current output and the target
+  void train_readout_step(int step){
+    static bool initialized = false;
+    //We need a P correlation matrix for each output
+    static Matrix Pij[2] = {Matrix(N,N), Matrix(N,N)};
+    static Vector temp(N);
+    if(!initialized){
+      //This is run at the first call of this function
+      //Correlation matrix, starts as a diagonal matrix
+      Pij[0].eye(1.0f/np.delta);
+      Pij[1].eye(1.0f/np.delta);
+      initialized = true;
+    }
+    
+    /**********For the two outputs**********/// RLS algorithm
+    for(int out = 0; out<2; out++){
+      // P = P- (P·X (P·X)^T)/(1+X'·P·X)
+      // P·X (P·X)^T -->> NxN matrix from two Nx1 vectors
+      float den = 0.0f; //denominator (1+X'PX)
+
+      temp = Pij[out]*X; //P·X	    
+
+      den = 1.0f + temp*X; //1+X'·P·X
+	    
+      //***Update Pij****//
+      fori(0,N) 
+	forj(0,N)
+	  Pij[out][i][j] -= temp[i]*temp[j]/den;
+
+      //***Estimate error****//
+      float error = Z[out] - target[out][step-sp.start_train];
+      //***Apply rule**// //Wout_i -= e*Pij*r
+      fori(0,N)
+	Wout[out][i] -= temp[i]*error/den; 
+
+    }//ENDFOR OUT
+  }
+  //Update the weights of the recurrent plastic units according to the current trajectory and the innate target one
+  void train_recurrent_step(int step){
+    static bool initialized = false;
+    int Nplastic = np.Nplastic; //Number of plastic units
+    //We need one P correlation matrix for each plastic unit
+    static vector<Matrix> Pij;
+    //Number of units connected to each plastic one
+    static vector<int> Npre_plastic(Nplastic,0);
+    //Indices of the units connected to each plastic one
+    static vector<vector<int>> pre_plastic_units(Nplastic);
+
+    if(!initialized){
+      //This is performed only the first time this function is called
+      //Fill Npre_plastic and pre_plastic_units using Wrec and set each Pij to the identity
+      fori(0,Nplastic){
+	forj(0,N) if(Wrec[i][j]!=0) pre_plastic_units[i].push_back(j);
+	Npre_plastic[i] = pre_plastic_units[i].size();
+	Pij.push_back(Matrix(Npre_plastic[i], Npre_plastic[i]));
+	Pij[i].eye(1.0/np.delta);
+      }
+      initialized = true;
+    }
+    int Npp;
+#pragma omp parallel for schedule(auto) num_threads(2) //Works best with two cores
+    //Update the Pij corr. matrix and the Wrec weights of each plastic unit, using the RLS algorithm, as in readout training
+    for(int unit=0; unit<Nplastic; unit++){
+      Npp = Npre_plastic[unit];
+      float temp[Npp];
+      float accum = 0.0f;
+      fori(0, Npp){
+	accum = 0.0f;
+	forj(0, Npp){
+	  accum += Pij[unit][i][j]*X[pre_plastic_units[unit][j]];
+	}
+	temp[i] = accum;
+      }
+
+      float den = 0.0f;
+      fori(0,Npp) den += X[pre_plastic_units[unit][i]]*temp[i];
+      den += 1.0f;
+
+      fori(0,Npp) 
+	forj(0,Npp)
+	Pij[unit][i][j] -= temp[i]*temp[j]/den;
+      
+      //The error is now related with the current and innate trajectories
+      float error;
+      error = X[unit] - XvsT[step][unit];
+      fori(0,Npp){
+	Wrec[unit][pre_plastic_units[unit][i]] -= error*temp[i]/den;
+      }
+      
+    }
+    
+  }
+
+};
+
+int main(int argc, char* argv[]){
+  NetworkParameters np;
+  SimulationParameters sp;
+  /**Set default parameters**/
+  sp.perturbation = false;
+  np.Anoise     = 0.0f;
+  np.pc         = 0.1f;
+  np.g          = 1.5f;
+  np.delta      = 1.0f;
+  np.tau        = 10.0f;
+  np.N          = 800;
+  np.Nplastic   = 480;
+
+
+  if(argc==1){
+    cerr<<"Missing target input!!"<<endl;
+    exit(1);
+  }
+
+
+  /**Some input flags to control the simulation**/
+  bool train= true;
+  bool save = true;
+  char *loadFile = NULL;
+  fori(0,argc){
+    if(string(argv[i])==string("--notrain")) train = false;   
+    if(string(argv[i])==string("--nosave")) save = false;
+    if(string(argv[i])==string("--load")) loadFile = argv[i+1];
+    if(string(argv[i])==string("--perturbation")) sp.perturbation = true;
+    if(string(argv[i])==string("--noiseAmp")) np.Anoise = stod(argv[i+1],NULL);
+    if(string(argv[i])==string("--pconnect")) np.pc = stod(argv[i+1],NULL);
+  }
+
+  np.scale      = np.g /sqrt(np.pc*np.N);
+  /***Target processing and read***/
+  int nlines = 0;
+  vector<vector<float>> target(2);
+  string line;
+  std::ifstream in(argv[1]);
+  while(std::getline(in, line)) ++nlines;
+  in.close();
+  target[0].resize(nlines);
+  target[1].resize(nlines);
+  in.open(argv[1]);
+  fori(0,nlines)  in>>target[0][i]>>target[1][i];
+
+  
+
+
+
+  /***Simulation configuration****/
+
+  sp.learn_skip = 2;
+  sp.dt         = 1.0f;
+  
+  float start_pulse = 200;
+  float reset_duration = 50;
+
+  sp.input_pulse_value = 2.0f;
+  
+  sp.start_pulse = int(start_pulse/sp.dt+0.5);
+  sp.reset_duration = int(reset_duration/sp.dt+0.5);
+  
+  /***The training starts after the pulse****/
+  sp.start_train = sp.start_pulse + sp.reset_duration;
+  /**And ends after the target ends**/
+  sp.end_train = sp.start_train + target[0].size();
+  
+  /**Perform some integration steps after the training***/
+  sp.nsteps = int((sp.end_train+1000)/sp.dt);
+
+  /**Just one loop to get the innate trajectory**/
+  sp.nloops    = 1;
+  
+  sp.get_innate = true;
+  sp.saveX = true;
+  sp.saveZ = true;
+
+  /**Create the network**/
+  RRN rrn(target, np, sp);
+  if(loadFile){
+    rrn.load(loadFile);
+    cerr<<"Using network in "<<loadFile<<endl;
+  }
+  else   cerr<<"Using random network"<<endl;
+
+  
+  if(train){
+    /**Get innate trajectory**/
+    rrn.train_network(NONE);
+  
+    /**Train the recurrent network according to the innate trayectory**/
+    np.Anoise = 0.0f;
+    sp.nloops = 30;
+    sp.get_innate = false;
+    sp.saveX = true;
+    sp.saveZ = false;
+  
+    rrn.update_params(np, sp);
+  
+    rrn.train_network(RECURRENT);
+  
+    /**Train the output weigths to fit the target pattern**/
+    np.Anoise = 0.0f;
+    sp.nloops = 10;
+    sp.saveX = false;
+    sp.saveZ = true;  
+    rrn.update_params(np, sp);
+
+    rrn.train_network(READOUT);
+    
+    /**Perform one loop without training and save the trajectory**/
+    sp.saveX = true;
+    sp.nloops = 1;
+    rrn.update_params(np, sp);
+    rrn.train_network(NONE);
+
+  }
+  else{
+    sp.get_innate = false;
+    sp.saveX = true;
+    sp.saveZ = true;
+
+    sp.nloops = 1;
+    rrn.update_params(np, sp);
+    rrn.train_network(NONE);
+  }
+  /**Save the network state for posterior usage**/
+  if(save)rrn.save();
+  return 0;
+}

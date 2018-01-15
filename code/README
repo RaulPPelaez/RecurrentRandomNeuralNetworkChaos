@@ -1,0 +1,42 @@
+
+#######ABOUT THE MAIN CODE#########################
+The main code is RRN.cpp, the rest are helper libraries.
+
+This code is extensively commented and guided.
+
+RRN.cpp is prepared to train a network with two output and input units
+	(although one of the inputs is always zero). The target pattern is
+	given through a file with two columns, just x y.
+
+You can test it with:
+
+$ make
+$ ./RRN INPUT_FROM_TABLET/Raul.xy
+
+The code needs a compiler with C++11 support, although you may try to
+change -std=c++11 by -std=c++0x in case your compiler is old and complains.
+
+Further capabilities can be found at the begining of the code.
+
+###############ABOUT THE FIGURES##################
+
+The folder DATA contains a subfolder for each figure we reproduced in the
+original paper by Laje, et al.
+
+Inside each subfolder there is a script called run.bash. Running this script
+will compile the code, run the simulations, analyze the results and draw the figures, wich will be moved to a new folder called figures here.
+
+In order to run this script you need to have octave installed, 
+as well as matlab in the case of figure 4. You can change the script to
+not use either of these, but further work will be needed to replace them.
+
+Octave is used only to generate the target pulses, and matlab to compute R squared. We use Matlab in order to compute the same magnitude the authors of the paper call "Performance".
+
+Each subfolder contains a version of the code, adapted to the particular case (they are almost identical to this one, but are adapted to train a system with only one input and output units).
+
+#################ABOUT THE INPUT FROM THE TABLET###################
+
+This utility allows to create .xy files for RRN using the touchscreen of a tablet.
+Instructions of usage are inside the folder.
+
+
